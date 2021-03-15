@@ -1,10 +1,11 @@
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self};
 use tonic::Request;
 // use tonic::IntoStreamingRequest;
-use tokio::task;
-// use futures::{future, AsyncBufReadExt, AsyncWriteExt, SinkExt};
-// use futures::prelude::*;
 
+use tokio::task;
+
+use std::sync::Arc;
+use std::sync::atomic::*;
 use std::{thread, time, io};
 
 use common::ss_user_update;
@@ -12,7 +13,7 @@ use common::ss_user_update;
 use common::ss_response;
 use common::SsRequest;
 use common::SsUserUpdate;
-// use common::session_client;
+use common::SsSubscriptionUpdate;
 use common::session_client::SessionClient;
 
 fn get_token() -> String {
@@ -42,8 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         Ok(req)
     });
-    
-    println!("Preparing request...");
+
     let request = tonic::Request::new(SsRequest {
         user_id: 123,
         msg_timestamp: 9878374,
@@ -68,8 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("RESPONSE: session ID = {}", response.session_id);
 
+    let mutate = Arc::new(AtomicBool::new(true));
+    let flag_clone = mutate.clone();
     // let _another_client: session_client::SessionClient;
-    let async_client_fut = task::spawn(update_stream(channel_copy));
+    let async_client_fut = task::spawn(update_stream(channel_copy, flag_clone));
 
     println!("Waining for a console input...");
     let mut input = String::new();
@@ -93,9 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
     }
+    mutate.store(false, Ordering::Relaxed);
+
     match async_client_fut.await {
-        Ok(res_val) => println!("Async processing..."),
-        Err(res_err) => println!("Failed async client creation!")
+        Ok(_) => println!("Async processing..."),
+        Err(_) => println!("Failed async client creation!")
     };
 
     let request_close = tonic::Request::new(SsRequest {
@@ -116,9 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-
-async fn update_stream(channel: tonic::transport::Channel) -> Result<(),()> {
-
+// #############################################################################
+//
+async fn update_stream(channel: tonic::transport::Channel, running: Arc<AtomicBool>) 
+    -> Result<(),()> 
+{
     let token = get_token();
     let mut client = SessionClient::with_interceptor(channel, move |mut req: Request<()>| {
         req.metadata_mut().insert(
@@ -127,22 +133,44 @@ async fn update_stream(channel: tonic::transport::Channel) -> Result<(),()> {
         );
         Ok(req)
     });
-    println!("Starting async sending loop");
+    
+    let mut results = Vec::<SsSubscriptionUpdate>::new();
+
     let mut iter_count: u16 = 0;
     let mut session_is_active = true;
-    while session_is_active == true {
+    let hundred_millis = time::Duration::from_millis(1000);
+
+    println!("Starting async sending loop");
+    while session_is_active == true && running.load(Ordering::SeqCst) {
+        let mut sec_utime: u64 = 0;
+        match time::SystemTime::now().duration_since(time::SystemTime::UNIX_EPOCH) {
+            Ok(n) => sec_utime = n.as_secs(),
+            Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+        }
         let client_update = vec!( SsUserUpdate {
             latitude: 1.0,
             longitude: 2.0,
-            location_timestamp: 100300500,
+            location_timestamp: sec_utime,
             status: ss_user_update::Status::Passive as i32,
         } );
-        client.update(stream::iter(client_update));
-        let hundred_millis = time::Duration::from_millis(100);
-        let now = time::Instant::now();
-        
+        let update_result = client.update(stream::iter(client_update)).await;
+
+        match update_result {
+            Ok(stream_resp) => {
+                let subscription_update = stream_resp.into_inner().message().await;
+                match subscription_update {
+                    Ok( Some(stream_msg) ) => {
+                        println!("Rcvd: {:?}", stream_msg);
+                        results.push(stream_msg);
+                    }
+                    Ok( None ) => println!("none"),
+                    Err(_) => println!("err")
+                }
+            }
+            Err(_)  => break,
+        }
+
         thread::sleep(hundred_millis);        
-        assert!(now.elapsed() >= hundred_millis);
 
         println!("Awaiting session to close... {}", iter_count);
         iter_count += 1;
@@ -153,3 +181,5 @@ async fn update_stream(channel: tonic::transport::Channel) -> Result<(),()> {
 
     Ok(())
 }
+
+// ###################################################################################
